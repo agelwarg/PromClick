@@ -2,13 +2,15 @@ package clickhouse
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"sort"
+	"strings"
 	"time"
 
-	"github.com/ClickHouse/ch-go"
-	"github.com/ClickHouse/ch-go/proto"
 	"github.com/prometheus/prometheus/prompb"
 
 	"github.com/PromClick/PromClick/fingerprint"
@@ -16,17 +18,17 @@ import (
 
 // WriterConfig holds configuration for the batch writer.
 type WriterConfig struct {
-	Database       string
-	BatchSize      int
-	QueueSize      int
-	FlushInterval  time.Duration
+	Database      string
+	BatchSize     int
+	QueueSize     int
+	FlushInterval time.Duration
 }
 
 // Writer batches incoming remote_write data and flushes to ClickHouse.
 type Writer struct {
-	pool   *Pool
-	cfg    WriterConfig
-	queue  chan writeBatch
+	pool *Pool
+	cfg  WriterConfig
+	queue chan writeBatch
 }
 
 type writeBatch struct {
@@ -85,7 +87,6 @@ func (w *Writer) run(ctx context.Context) {
 				batch = batch[:0]
 			}
 		case <-ctx.Done():
-			// Drain remaining
 			if len(batch) > 0 {
 				w.flush(context.Background(), batch)
 			}
@@ -94,149 +95,166 @@ func (w *Writer) run(ctx context.Context) {
 	}
 }
 
-type sampleRow struct {
-	fingerprint uint64
-	metricName  string
-	unixMilli   int64
-	value       float64
-}
-
-type seriesRow struct {
-	fingerprint uint64
-	metricName  string
-	labels      map[string]string
-	unixMilli   int64
+// tsRow holds all data for one unique label-set (fingerprint) in a write batch.
+type tsRow struct {
+	fp        [16]byte
+	tagNames  []string
+	tagValues []string
+	// values__float64 entries: (poll_epoch_ns, value, field)
+	samples [][3]interface{} // [int64, float64, string]
 }
 
 func (w *Writer) flush(ctx context.Context, series []prompb.TimeSeries) {
 	t0 := time.Now()
 
-	// Deduplicate series metadata and collect all samples
-	seenSeries := make(map[string]bool)
-	var seriesRows []seriesRow
-	var sampleRows []sampleRow
+	// Group samples by fingerprint (all labels INCLUDING __name__)
+	type key = [16]byte
+	rowMap := make(map[key]*tsRow, len(series))
 
 	for i := range series {
 		ts := &series[i]
+
+		// Build full label map including __name__
 		labels := make(map[string]string, len(ts.Labels))
-		metricName := ""
 		for _, l := range ts.Labels {
-			if l.Name == "__name__" {
-				metricName = l.Value
-			} else {
-				labels[l.Name] = l.Value
-			}
+			labels[l.Name] = l.Value
 		}
 
 		fp := fingerprint.Compute(labels)
 
-		// Time-bucketing: use first sample timestamp, rounded to hour
-		const hourMs int64 = 3_600_000
-		var bucketMilli int64
-		if len(ts.Samples) > 0 {
-			bucketMilli = (ts.Samples[0].Timestamp / hourMs) * hourMs
-		} else {
-			bucketMilli = (time.Now().UnixMilli() / hourMs) * hourMs
-		}
+		row, ok := rowMap[fp]
+		if !ok {
+			// Build sorted tag_names/tag_values (deterministic order)
+			keys := make([]string, 0, len(labels))
+			for k := range labels {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
 
-		// Dedup key must include metric_name: different metrics with
-		// identical labels share the same fingerprint but need separate
-		// rows in time_series.
-		dedup := fmt.Sprintf("%d:%s", fp, metricName)
-		if !seenSeries[dedup] {
-			seenSeries[dedup] = true
-			seriesRows = append(seriesRows, seriesRow{
-				fingerprint: fp,
-				metricName:  metricName,
-				labels:      labels,
-				unixMilli:   bucketMilli,
-			})
+			names := make([]string, len(keys))
+			values := make([]string, len(keys))
+			for i, k := range keys {
+				names[i] = k
+				values[i] = labels[k]
+			}
+
+			row = &tsRow{
+				fp:        fp,
+				tagNames:  names,
+				tagValues: values,
+			}
+			rowMap[fp] = row
 		}
 
 		for _, s := range ts.Samples {
-			sampleRows = append(sampleRows, sampleRow{
-				fingerprint: fp,
-				metricName:  metricName,
-				unixMilli:   s.Timestamp,
-				value:       s.Value,
-			})
+			// Prometheus timestamps are in milliseconds; convert to nanoseconds.
+			nsTs := s.Timestamp * 1_000_000
+			row.samples = append(row.samples, [3]interface{}{nsTs, s.Value, ""})
 		}
 	}
 
-	// INSERT time_series
-	if len(seriesRows) > 0 {
-		if err := w.insertTimeSeries(ctx, seriesRows); err != nil {
-			slog.Error("write: insert time_series failed", "error", err, "rows", len(seriesRows))
-		}
+	if len(rowMap) == 0 {
+		return
 	}
 
-	// INSERT samples
-	if len(sampleRows) > 0 {
-		if err := w.insertSamples(ctx, sampleRows); err != nil {
-			slog.Error("write: insert samples failed", "error", err, "rows", len(sampleRows))
-		}
+	if err := w.insertRows(ctx, rowMap); err != nil {
+		slog.Error("write: insert __ts failed", "error", err, "rows", len(rowMap))
 	}
 
 	slog.Debug("write: flush",
-		"series", len(seriesRows),
-		"samples", len(sampleRows),
+		"series", len(rowMap),
 		"duration", time.Since(t0),
 	)
 }
 
-func labelsToJSON(m map[string]string) string {
-	b, err := json.Marshal(m)
+// insertRows inserts all rows into data__tagset.__ts via HTTP VALUES INSERT.
+// The Null engine fires the materialized views which fan out to the real tables.
+func (w *Writer) insertRows(ctx context.Context, rows map[[16]byte]*tsRow) error {
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(w.cfg.Database)
+	sb.WriteString(".__ts ")
+	sb.WriteString("(insert_ts, source, fingerprint, tag_names, tag_values, ")
+	sb.WriteString("values__float64, values__boolean, values__int64, values__string, values__uint64) ")
+	sb.WriteString("VALUES\n")
+
+	now := time.Now().UTC().Format("2006-01-02 15:04:05")
+	first := true
+	for _, row := range rows {
+		if !first {
+			sb.WriteString(",\n")
+		}
+		first = false
+
+		fmt.Fprintf(&sb, "('%s', 'prometheus', unhex('%s'), %s, %s, %s, [], [], [], [])",
+			now,
+			hex.EncodeToString(row.fp[:]),
+			sqlStringArray(row.tagNames),
+			sqlStringArray(row.tagValues),
+			sqlFloat64Tuples(row.samples),
+		)
+	}
+
+	return w.execHTTP(ctx, sb.String())
+}
+
+// execHTTP sends a SQL statement to ClickHouse via HTTP POST.
+func (w *Writer) execHTTP(ctx context.Context, sql string) error {
+	u := strings.TrimRight(w.pool.httpAddr, "/") + "/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(sql))
 	if err != nil {
-		slog.Error("labelsToJSON: marshal failed", "error", err)
-		return "{}"
+		return err
 	}
-	return string(b)
+	if w.pool.httpUser != "" {
+		req.SetBasicAuth(w.pool.httpUser, w.pool.httpPassword)
+	}
+	resp, err := w.pool.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	return nil
 }
 
-func (w *Writer) insertTimeSeries(ctx context.Context, rows []seriesRow) error {
-	var colMN proto.ColStr
-	var colFP proto.ColUInt64
-	var colTS proto.ColInt64
-	var colLabels proto.ColStr
-
-	for _, r := range rows {
-		colMN.Append(r.metricName)
-		colFP.Append(r.fingerprint)
-		colTS.Append(r.unixMilli)
-		colLabels.Append(labelsToJSON(r.labels))
+// sqlStringArray formats a []string as a ClickHouse array literal: ['v1','v2']
+func sqlStringArray(ss []string) string {
+	if len(ss) == 0 {
+		return "[]"
 	}
-
-	return w.pool.pool.Do(ctx, ch.Query{
-		Body: fmt.Sprintf("INSERT INTO %s.time_series VALUES", w.cfg.Database),
-		Input: proto.Input{
-			{Name: "metric_name", Data: &colMN},
-			{Name: "fingerprint", Data: &colFP},
-			{Name: "unix_milli", Data: &colTS},
-			{Name: "labels", Data: &colLabels},
-		},
-	})
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, s := range ss {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(s, "'", "\\'"))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
-func (w *Writer) insertSamples(ctx context.Context, rows []sampleRow) error {
-	var colFP proto.ColUInt64
-	var colMN proto.ColStr
-	var colTS proto.ColInt64
-	var colVal proto.ColFloat64
-
-	for _, r := range rows {
-		colFP.Append(r.fingerprint)
-		colMN.Append(r.metricName)
-		colTS.Append(r.unixMilli)
-		colVal.Append(r.value)
+// sqlFloat64Tuples formats samples as [(ns, val, field), ...] for values__float64.
+func sqlFloat64Tuples(samples [][3]interface{}) string {
+	if len(samples) == 0 {
+		return "[]"
 	}
-
-	return w.pool.pool.Do(ctx, ch.Query{
-		Body: fmt.Sprintf("INSERT INTO %s.samples VALUES", w.cfg.Database),
-		Input: proto.Input{
-			{Name: "fingerprint", Data: &colFP},
-			{Name: "metric_name", Data: &colMN},
-			{Name: "unix_milli", Data: &colTS},
-			{Name: "value", Data: &colVal},
-		},
-	})
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, s := range samples {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		ns := s[0].(int64)
+		val := s[1].(float64)
+		field := s[2].(string)
+		fmt.Fprintf(&b, "(%d,%g,'%s')", ns, val, strings.ReplaceAll(field, "'", "\\'"))
+	}
+	b.WriteByte(']')
+	return b.String()
 }

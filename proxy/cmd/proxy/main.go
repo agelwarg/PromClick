@@ -64,6 +64,7 @@ func main() {
 			TimestampCol:    cfg.Schema.Columns.Timestamp,
 			ValueCol:        cfg.Schema.Columns.Value,
 			MetricNameCol:   cfg.Schema.Columns.MetricName,
+			TimestampNanos:  true,
 		}
 		pool, err := nativech.NewPool(cfg.ClickHouse.NativeAddr, cfg.ClickHouse.Database, cfg.ClickHouse.User, cfg.ClickHouse.Password, cfg.ClickHouse.HTTPAddr, schema)
 		if err != nil {
@@ -79,26 +80,6 @@ func main() {
 				}
 			}
 			logger.Info("ch-go connections warmed up")
-
-			// Label cache — eliminates JOIN per query
-			if cfg.Labels.CacheEnabled {
-				lc := nativech.NewLabelCache(cfg.Labels.CacheTTL, cfg.Labels.CacheMaxSeries,
-					pool.HTTPClient,
-					cfg.ClickHouse.HTTPAddr, cfg.ClickHouse.Database,
-					cfg.ClickHouse.User, cfg.ClickHouse.Password,
-					cfg.Schema.TimeSeriesTable,
-					cfg.Schema.Columns.Fingerprint,
-					cfg.Schema.Columns.MetricName,
-					cfg.Schema.Columns.Labels,
-				)
-				if err := lc.Refresh(context.Background()); err != nil {
-					logger.Warn("label cache initial load failed", "error", err)
-				} else {
-					logger.Info("label cache loaded", "series", lc.Size())
-				}
-				lc.StartBackgroundRefresh(context.Background())
-				pool.LabelCache = lc
-			}
 
 			evaluator = eval.NewWithFetcher(promCfg, pool)
 			queryPool = pool

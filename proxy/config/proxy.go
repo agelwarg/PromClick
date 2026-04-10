@@ -62,7 +62,7 @@ func defaults() *Config {
 		QueryTimeout: 2 * time.Minute,
 		ClickHouse: CHConfig{
 			HTTPAddr: "http://localhost:8123",
-			Database: "metrics",
+			Database: "data__tagset",
 			User:     "default",
 			Password: "",
 		},
@@ -73,7 +73,7 @@ func defaults() *Config {
 			MaxFreshness: 60 * time.Second,
 		},
 		Labels: LabelsConfig{
-			CacheEnabled:   true,
+			CacheEnabled:   false,
 			CacheTTL:       60 * time.Second,
 			CacheMaxSeries: 10000,
 		},
@@ -81,16 +81,16 @@ func defaults() *Config {
 			AllowOrigin: "*",
 		},
 		Schema: SchemaConfig{
-			SamplesTable:    "samples",
-			TimeSeriesTable: "time_series",
+			SamplesTable:    "__ts_samples__float64",
+			TimeSeriesTable: "__ts_by_name",
 			Columns: ColumnConfig{
-				MetricName:  "metric_name",
-				Timestamp:   "unix_milli",
+				MetricName:  "__name__",
+				Timestamp:   "poll_epoch_ns",
 				Value:       "value",
 				Fingerprint: "fingerprint",
-				Labels:      "labels",
+				Labels:      "tag_names",
 			},
-			LabelsType: "json",
+			LabelsType: "arrays",
 		},
 		Downsampling: DownsamplingConfig{
 			Enabled: false,

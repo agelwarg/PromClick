@@ -1,15 +1,15 @@
 package fingerprint
 
 import (
+	"crypto/md5"
 	"sort"
-
-	"github.com/cespare/xxhash/v2"
 )
 
-// Compute calculates an xxhash64 fingerprint from labels.
-// Sorts keys, builds "k\xffv\xff..." string, hashes.
-// Compatible with qryn.
-func Compute(labels map[string]string) uint64 {
+// Compute calculates an MD5 fingerprint from labels, producing a FixedString(16)-
+// compatible [16]byte value.
+// All labels (including __name__) are included in the hash.
+// Keys are sorted alphabetically; input is built as "k\xffv\xffk\xffv\xff...".
+func Compute(labels map[string]string) [16]byte {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
 		keys = append(keys, k)
@@ -23,5 +23,5 @@ func Compute(labels map[string]string) uint64 {
 		b = append(b, labels[k]...)
 		b = append(b, 0xff)
 	}
-	return xxhash.Sum64(b)
+	return md5.Sum(b)
 }

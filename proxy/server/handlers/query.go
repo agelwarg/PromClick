@@ -13,7 +13,6 @@ import (
 
 	"github.com/PromClick/PromClick/config"
 	"github.com/PromClick/PromClick/eval"
-	"github.com/PromClick/PromClick/fingerprint"
 	"github.com/PromClick/PromClick/translator"
 	"github.com/PromClick/PromClick/types"
 
@@ -299,122 +298,10 @@ func (h *Handler) tryDownsampledQuery(
 		return nil, false // all raw, use normal path
 	}
 
-	// Resolve fingerprints from label cache
-	if h.Pool.LabelCache == nil || !h.Pool.LabelCache.IsLoaded() {
-		return nil, false
-	}
-
-	var matchers []nativech.LabelMatcher
-	for _, m := range plan.Matchers {
-		matchers = append(matchers, nativech.LabelMatcher{
-			Name: m.Name, Op: m.Op, Value: m.Val,
-		})
-	}
-	fps, ok := h.Pool.LabelCache.GetFingerprints(plan.MetricName, matchers)
-	if !ok || len(fps) == 0 {
-		return nil, false
-	}
-
-	// Convert string fps to uint64
-	fpUints := make([]uint64, 0, len(fps))
-	for _, fp := range fps {
-		if v, err := strconv.ParseUint(fp, 10, 64); err == nil {
-			fpUints = append(fpUints, v)
-		}
-	}
-
-	// Get metric type
-	metricType := h.Pool.GetMetricType(r.Context(), plan.MetricName)
-
-	// Build segmented query — try top-level function first,
-	// then inner function if top-level is a math wrapper (abs, ceil, sort, etc.)
-	queryFn := plan.FuncName
-	var mathPostProcess string
-	sql, err := nativech.BuildSegmentedQuery(
-		queryFn, metricType, plan.MetricName,
-		segments, fpUints, step,
-	)
-	if errors.Is(err, nativech.ErrRequiresRawSamples) && plan.Inner != nil && plan.Inner.FuncName != "" {
-		// Top-level unsupported (math wrapper) — try inner function
-		queryFn = plan.Inner.FuncName
-		mathPostProcess = plan.FuncName
-		sql, err = nativech.BuildSegmentedQuery(
-			queryFn, metricType, plan.MetricName,
-			segments, fpUints, step,
-		)
-	}
-	if errors.Is(err, nativech.ErrRequiresRawSamples) {
-		slog.Debug("downsampling: function requires raw samples", "fn", queryFn)
-		return nil, false
-	}
-	if err != nil {
-		slog.Warn("downsampling: build query failed", "error", err)
-		return nil, false
-	}
-
-	// Execute via pool — different paths for counter vs gauge functions
-	isCounterFn := queryFn == "rate" || queryFn == "increase"
-	isGaugeFn := queryFn == "avg_over_time" || queryFn == "min_over_time" || queryFn == "max_over_time" || queryFn == "sum_over_time" || queryFn == "count_over_time"
-	var matrix types.Matrix
-
-	if isCounterFn {
-		// Fast path: when range <= 2*step, each step needs ≤2 buckets.
-		// Use ExecTierQueryRaw + lightweight sliding window (43ms for 1111 series).
-		seriesMap, err := h.Pool.ExecTierQueryRaw(r.Context(), sql, fps)
-		if err != nil {
-			slog.Warn("downsampling: exec failed, falling back to raw", "error", err)
-			return nil, false
-		}
-		matrix = windowedCounterEval(seriesMap, queryFn, plan.RangeMs, start, end, step)
-	} else if isGaugeFn {
-		gaugeMap, err := h.Pool.ExecGaugeQuery(r.Context(), sql, fps)
-		if err != nil {
-			slog.Warn("downsampling: exec failed, falling back to raw", "error", err)
-			return nil, false
-		}
-		// SQL push-down: data is already GROUP BY step, just pick the right column
-		matrix = gaugeToMatrix(gaugeMap, queryFn)
-	} else {
-		var err error
-		matrix, err = h.Pool.ExecTierQuery(r.Context(), sql, fps)
-		if err != nil {
-			slog.Warn("downsampling: exec failed, falling back to raw", "error", err)
-			return nil, false
-		}
-	}
-
-	// Apply aggregation chain FIRST (e.g. sum by(region)(rate(...)))
-	// Math post-processing (clamp, abs, sort) wraps the aggregate, so must come after.
-	if len(plan.AggChain) > 0 {
-		var aggErr error
-		matrix, aggErr = applyAggChain(matrix, plan.AggChain, h.Pool.LabelCache)
-		if errors.Is(aggErr, ErrUnsupportedAggOp) {
-			slog.Debug("downsampling: unsupported agg op, falling back to raw", "chain", plan.AggChain)
-			return nil, false
-		}
-	}
-
-	// Apply math post-processing AFTER aggregation (abs, ceil, clamp, sort wrap the aggregate)
-	if mathPostProcess != "" {
-		matrix = applyMathFunc(matrix, mathPostProcess, plan)
-	}
-
-	series := len(matrix)
-	slog.Info("query_range",
-		"query", plan.MetricName,
-		"path", "downsampled",
-		"tier", selectedTier.Name,
-		"segments", len(segments),
-		"range", end.Sub(start).String(),
-		"step", step.String(),
-		"series", series,
-		"total", time.Since(t0),
-	)
-
-	return &types.QueryResult{
-		Type:   "matrix",
-		Matrix: matrix,
-	}, true
+	// Downsampling tier queries not yet adapted for tagset schema.
+	_ = segments
+	_ = t0
+	return nil, false
 }
 
 // windowedCounterEval evaluates rate/increase on per-bucket tier data
@@ -629,10 +516,10 @@ func windowedGaugeEval(
 var ErrUnsupportedAggOp = errors.New("unsupported aggregation operator on downsampled tier")
 
 // applyAggChain applies aggregation steps to a matrix (e.g. sum by(region)).
-func applyAggChain(matrix types.Matrix, chain []translator.AggStep, lc *nativech.LabelCache) (types.Matrix, error) {
+func applyAggChain(matrix types.Matrix, chain []translator.AggStep) (types.Matrix, error) {
 	var err error
 	for _, step := range chain {
-		matrix, err = applyAggStep(matrix, step, lc)
+		matrix, err = applyAggStep(matrix, step)
 		if err != nil {
 			return nil, err
 		}
@@ -640,7 +527,7 @@ func applyAggChain(matrix types.Matrix, chain []translator.AggStep, lc *nativech
 	return matrix, nil
 }
 
-func applyAggStep(matrix types.Matrix, step translator.AggStep, lc *nativech.LabelCache) (types.Matrix, error) {
+func applyAggStep(matrix types.Matrix, step translator.AggStep) (types.Matrix, error) {
 	switch step.Op {
 	case "sum", "avg", "min", "max", "count":
 		return aggregateMatrix(matrix, step), nil
@@ -898,87 +785,11 @@ func (h *Handler) tryDownsampledHistogram(
 		return nil, false
 	}
 
-	if h.Pool.LabelCache == nil || !h.Pool.LabelCache.IsLoaded() {
-		return nil, false
-	}
-
-	var matchers []nativech.LabelMatcher
-	for _, m := range plan.Matchers {
-		matchers = append(matchers, nativech.LabelMatcher{
-			Name: m.Name, Op: m.Op, Value: m.Val,
-		})
-	}
-	fps, ok := h.Pool.LabelCache.GetFingerprints(plan.MetricName, matchers)
-	if !ok || len(fps) == 0 {
-		return nil, false
-	}
-
-	fpUints := make([]uint64, 0, len(fps))
-	for _, fp := range fps {
-		if v, err := strconv.ParseUint(fp, 10, 64); err == nil {
-			fpUints = append(fpUints, v)
-		}
-	}
-
-	metricType := h.Pool.GetMetricType(r.Context(), plan.MetricName)
-
-	// Execute inner function on tier — returns per-fingerprint values
-	sql, err := nativech.BuildSegmentedQuery(
-		innerFn, metricType, plan.MetricName,
-		segments, fpUints, step,
-	)
-	if err != nil {
-		slog.Debug("downsampling histogram: build query failed", "error", err)
-		return nil, false
-	}
-
-	matrix, err := h.Pool.ExecTierQuery(r.Context(), sql, fps)
-	if err != nil {
-		slog.Warn("downsampling histogram: exec failed", "error", err)
-		return nil, false
-	}
-
-	// Apply aggregation chain (e.g. sum by(le)) from AggChain
-	if len(plan.AggChain) > 0 {
-		var aggErr error
-		matrix, aggErr = applyAggChain(matrix, plan.AggChain, h.Pool.LabelCache)
-		if errors.Is(aggErr, ErrUnsupportedAggOp) {
-			slog.Debug("downsampling histogram: unsupported agg op, falling back to raw")
-			return nil, false
-		}
-	}
-
-	// Validate that result has "le" labels — required for histogram_quantile
-	hasLE := false
-	for _, s := range matrix {
-		if _, ok := s.Labels["le"]; ok {
-			hasLE = true
-			break
-		}
-	}
-	if !hasLE && len(matrix) > 0 {
-		slog.Debug("downsampling histogram: no le labels in result, falling back to raw")
-		return nil, false
-	}
-
-	// Now matrix has series grouped by "le" label.
-	// Compute histogram_quantile per step timestamp.
-	result := computeHistogramQuantile(phi, matrix, step)
-
-	slog.Info("query_range",
-		"query", plan.MetricName,
-		"path", "downsampled+histogram",
-		"tier", selectedTier.Name,
-		"segments", len(segments),
-		"phi", phi,
-		"series", len(result),
-		"total", time.Since(t0),
-	)
-
-	return &types.QueryResult{
-		Type:   "matrix",
-		Matrix: result,
-	}, true
+	// Downsampling histogram queries not yet adapted for tagset schema.
+	_ = segments
+	_ = phi
+	_ = t0
+	return nil, false
 }
 
 // computeHistogramQuantile computes histogram_quantile(φ) across le-grouped series per step.
@@ -1136,136 +947,17 @@ func applyMathFunc(matrix types.Matrix, fn string, plan *translator.SQLPlan) typ
 	return matrix
 }
 
-// tryCacheOnlyAgg handles count/group aggregations on plain vector selectors
-// directly from label cache — zero CH fetch, zero samples transfer.
-// Works for: count by(X)(metric), group by(X)(metric)
+// tryCacheOnlyAgg is disabled — requires in-memory label cache which has been
+// replaced by SQL-based fingerprint lookups against __ts_by_name.
 func (h *Handler) tryCacheOnlyAgg(
 	plan *translator.SQLPlan,
 	start, end time.Time,
 	step time.Duration,
 	t0 time.Time,
 ) (*types.QueryResult, bool) {
-	// Must have label cache
-	if h.Pool == nil || h.Pool.LabelCache == nil || !h.Pool.LabelCache.IsLoaded() {
-		return nil, false
-	}
-
-	// Must be a simple aggregation on a plain vector selector (no range function)
-	if plan.FuncName != "" || plan.ExprType == "binary" {
-		return nil, false
-	}
-
-	// Get the aggregation op — single-level only
-	var aggOp string
-	var grouping []string
-	var without bool
-	if len(plan.AggChain) == 1 {
-		aggOp = plan.AggChain[0].Op
-		grouping = plan.AggChain[0].Grouping
-		without = plan.AggChain[0].Without
-	} else if plan.AggOp != "" && len(plan.AggChain) == 0 {
-		aggOp = plan.AggOp
-		grouping = plan.Grouping
-		without = plan.Without
-	} else {
-		return nil, false
-	}
-
-	// Only count and group can be answered from labels alone
-	if aggOp != "count" && aggOp != "group" {
-		return nil, false
-	}
-
-	if plan.MetricName == "" {
-		return nil, false
-	}
-
-	// Get matchers
-	var matchers []nativech.LabelMatcher
-	for _, m := range plan.Matchers {
-		matchers = append(matchers, nativech.LabelMatcher{Name: m.Name, Op: m.Op, Value: m.Val})
-	}
-
-	fps, ok := h.Pool.LabelCache.GetFingerprints(plan.MetricName, matchers)
-	if !ok {
-		return nil, false
-	}
-
-	// Group fingerprints by grouping labels
-	type group struct {
-		labels map[string]string
-		count  int
-	}
-	groups := make(map[string]*group)
-	var order []string
-
-	for _, fp := range fps {
-		labels, hit := h.Pool.LabelCache.GetLabels(fp)
-		if !hit {
-			continue
-		}
-		gl := eval.GroupLabelsExported(labels, grouping, without)
-		key := eval.MatchingKey(gl, false, nil) // ignoring nothing = use all labels as key
-		g, exists := groups[key]
-		if !exists {
-			g = &group{labels: gl}
-			groups[key] = g
-			order = append(order, key)
-		}
-		g.count++
-	}
-
-	// Build result
-	var steps []int64
-	if step <= 0 {
-		steps = []int64{end.UnixMilli()}
-	} else {
-		for t := start; !t.After(end); t = t.Add(step) {
-			steps = append(steps, t.UnixMilli())
-		}
-	}
-
-	if len(steps) == 1 {
-		// Instant query
-		var vec types.Vector
-		for _, key := range order {
-			g := groups[key]
-			val := float64(g.count)
-			if aggOp == "group" {
-				val = 1.0
-			}
-			vec = append(vec, types.InstantSample{
-				Labels:      g.labels,
-				Fingerprint: fingerprint.Compute(g.labels),
-				T:           steps[0],
-				F:           val,
-			})
-		}
-		slog.Info("query", "query", plan.MetricName, "path", "cache-only", "series", len(vec), "total", time.Since(t0))
-		return &types.QueryResult{Type: "vector", Vector: vec}, true
-	}
-
-	// Range query — same value repeated for each step
-	var matrix types.Matrix
-	for _, key := range order {
-		g := groups[key]
-		val := float64(g.count)
-		if aggOp == "group" {
-			val = 1.0
-		}
-		samples := make([]types.Sample, len(steps))
-		for i, ts := range steps {
-			samples[i] = types.Sample{Timestamp: ts, Value: val}
-		}
-		matrix = append(matrix, types.Series{
-			Labels:      g.labels,
-			Fingerprint: fingerprint.Compute(g.labels),
-			Samples:     samples,
-		})
-	}
-
-	slog.Info("query_range", "query", plan.MetricName, "path", "cache-only", "series", len(matrix), "total", time.Since(t0))
-	return &types.QueryResult{Type: "matrix", Matrix: matrix}, true
+	_, _, _, _ = plan, start, end, step
+	_ = t0
+	return nil, false
 }
 
 func resultSeriesCount(qr *types.QueryResult) int {

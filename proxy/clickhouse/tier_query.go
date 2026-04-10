@@ -3,7 +3,6 @@ package clickhouse
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +19,7 @@ func BuildSegmentedQuery(
 	metricType MetricType,
 	metricName string,
 	segments []config.QuerySegment,
-	fingerprints []uint64,
+	fingerprints []string,
 	step time.Duration,
 	predictDuration ...time.Duration,
 ) (string, error) {
@@ -66,7 +65,7 @@ func BuildSegmentedQuery(
 // Go-side sliding window eval handles step windowing (43ms for 1111 series).
 func buildCounterRateUnion(
 	segments []config.QuerySegment,
-	fps []uint64,
+	fps []string,
 	metric string,
 	step time.Duration,
 	fn string,
@@ -99,7 +98,7 @@ ORDER BY fingerprint, step_ts`,
 }
 
 // buildTierCounterSegment — counter_total from a downsampled tier.
-func buildTierCounterSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildTierCounterSegment(seg config.QuerySegment, fps []string, metric string) string {
 	return fmt.Sprintf(`
     SELECT fingerprint, ts,
         toFloat64(counter_total) AS counter_total,
@@ -109,14 +108,14 @@ func buildTierCounterSegment(seg config.QuerySegment, fps []uint64, metric strin
     WHERE metric_name = '%s'
       AND fingerprint IN (%s)
       AND ts BETWEEN toDateTime('%s') AND toDateTime('%s')`,
-		seg.Table, metric, uintSliceToSQL(fps),
+		seg.Table, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 	)
 }
 
 // buildRawCounterSegment — raw samples pre-aggregated to bucket format with lagInFrame.
-func buildRawCounterSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildRawCounterSegment(seg config.QuerySegment, fps []string, metric string) string {
 	bucketExpr := "toStartOfFiveMinutes(toDateTime(intDiv(unix_milli, 1000)))"
 
 	return fmt.Sprintf(`
@@ -153,7 +152,7 @@ func buildRawCounterSegment(seg config.QuerySegment, fps []uint64, metric string
     )
     GROUP BY fingerprint, %s`,
 		bucketExpr,
-		metric, uintSliceToSQL(fps),
+		metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 		bucketExpr,
@@ -165,7 +164,7 @@ func buildRawCounterSegment(seg config.QuerySegment, fps []uint64, metric string
 // Handler picks the right column based on function name — no Go-side windowed eval.
 func buildGaugeUnion(
 	segments []config.QuerySegment,
-	fps []uint64,
+	fps []string,
 	metric string,
 	step ...time.Duration,
 ) string {
@@ -215,7 +214,7 @@ ORDER BY fingerprint, step_ts`,
 
 // buildTierGaugeSegment — gauge aggregates from a downsampled tier.
 // Cast SimpleAggregateFunction columns to plain types for ch-go compatibility.
-func buildTierGaugeSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildTierGaugeSegment(seg config.QuerySegment, fps []string, metric string) string {
 	return fmt.Sprintf(`
     SELECT fingerprint, ts,
         toFloat64(val_sum) AS val_sum,
@@ -226,14 +225,14 @@ func buildTierGaugeSegment(seg config.QuerySegment, fps []uint64, metric string)
     WHERE metric_name = '%s'
       AND fingerprint IN (%s)
       AND ts BETWEEN toDateTime('%s') AND toDateTime('%s')`,
-		seg.Table, metric, uintSliceToSQL(fps),
+		seg.Table, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 	)
 }
 
 // buildRawGaugeSegment — raw samples pre-aggregated to bucket format for gauge.
-func buildRawGaugeSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildRawGaugeSegment(seg config.QuerySegment, fps []string, metric string) string {
 	bucketExpr := "toStartOfFiveMinutes(toDateTime(intDiv(unix_milli, 1000)))"
 	return fmt.Sprintf(`
     SELECT
@@ -249,7 +248,7 @@ func buildRawGaugeSegment(seg config.QuerySegment, fps []uint64, metric string) 
       AND unix_milli >= toInt64(toUnixTimestamp(toDateTime('%s'))) * 1000
       AND unix_milli <  toInt64(toUnixTimestamp(toDateTime('%s'))) * 1000
     GROUP BY fingerprint, %s`,
-		bucketExpr, metric, uintSliceToSQL(fps),
+		bucketExpr, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 		bucketExpr,
@@ -261,7 +260,7 @@ func buildRawGaugeSegment(seg config.QuerySegment, fps []uint64, metric string) 
 // buildIRateUnion — irate() using last_value per bucket with lag window function.
 func buildIRateUnion(
 	segments []config.QuerySegment,
-	fps []uint64,
+	fps []string,
 	metric string,
 	step time.Duration,
 ) string {
@@ -318,7 +317,7 @@ ORDER BY fingerprint, step_ts`,
 	)
 }
 
-func buildTierIRateSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildTierIRateSegment(seg config.QuerySegment, fps []string, metric string) string {
 	return fmt.Sprintf(`
     SELECT fingerprint, ts,
         argMaxMerge(last_value) AS last_value,
@@ -328,13 +327,13 @@ func buildTierIRateSegment(seg config.QuerySegment, fps []uint64, metric string)
       AND fingerprint IN (%s)
       AND ts BETWEEN toDateTime('%s') AND toDateTime('%s')
     GROUP BY fingerprint, ts`,
-		seg.Table, metric, uintSliceToSQL(fps),
+		seg.Table, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 	)
 }
 
-func buildRawIRateSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildRawIRateSegment(seg config.QuerySegment, fps []string, metric string) string {
 	bucketExpr := "toStartOfFiveMinutes(toDateTime(intDiv(unix_milli, 1000)))"
 	return fmt.Sprintf(`
     SELECT fingerprint,
@@ -347,7 +346,7 @@ func buildRawIRateSegment(seg config.QuerySegment, fps []uint64, metric string) 
       AND unix_milli >= toInt64(toUnixTimestamp(toDateTime('%s'))) * 1000
       AND unix_milli <  toInt64(toUnixTimestamp(toDateTime('%s'))) * 1000
     GROUP BY fingerprint, %s`,
-		bucketExpr, metric, uintSliceToSQL(fps),
+		bucketExpr, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 		bucketExpr,
@@ -359,7 +358,7 @@ func buildRawIRateSegment(seg config.QuerySegment, fps []uint64, metric string) 
 // buildDerivUnion — deriv() using simpleLinearRegression on last_value per bucket.
 func buildDerivUnion(
 	segments []config.QuerySegment,
-	fps []uint64,
+	fps []string,
 	metric string,
 	step time.Duration,
 ) string {
@@ -398,7 +397,7 @@ ORDER BY fingerprint, step_ts`,
 
 func buildPredictLinearUnion(
 	segments []config.QuerySegment,
-	fps []uint64,
+	fps []string,
 	metric string,
 	step time.Duration,
 	predictDuration time.Duration,
@@ -438,7 +437,7 @@ ORDER BY fingerprint, step_ts`,
 
 // --- Shared regression segments ---
 
-func buildTierRegressionSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildTierRegressionSegment(seg config.QuerySegment, fps []string, metric string) string {
 	return fmt.Sprintf(`
     SELECT fingerprint, ts,
         argMaxMerge(last_value)  AS last_value,
@@ -448,13 +447,13 @@ func buildTierRegressionSegment(seg config.QuerySegment, fps []uint64, metric st
       AND fingerprint IN (%s)
       AND ts BETWEEN toDateTime('%s') AND toDateTime('%s')
     GROUP BY fingerprint, ts`,
-		seg.Table, metric, uintSliceToSQL(fps),
+		seg.Table, metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 	)
 }
 
-func buildRawRegressionSegment(seg config.QuerySegment, fps []uint64, metric string) string {
+func buildRawRegressionSegment(seg config.QuerySegment, fps []string, metric string) string {
 	bucketExpr := "toStartOfFiveMinutes(toDateTime(intDiv(unix_milli, 1000)))"
 	return fmt.Sprintf(`
     SELECT fingerprint,
@@ -468,25 +467,27 @@ func buildRawRegressionSegment(seg config.QuerySegment, fps []uint64, metric str
       AND unix_milli <  toInt64(toUnixTimestamp(toDateTime('%s'))) * 1000
     GROUP BY fingerprint, %s`,
 		bucketExpr, bucketExpr,
-		metric, uintSliceToSQL(fps),
+		metric, hexSliceToSQL(fps),
 		seg.Start.UTC().Format(time.DateTime),
 		seg.End.UTC().Format(time.DateTime),
 		bucketExpr,
 	)
 }
 
-// uintSliceToSQL converts a []uint64 to a comma-separated SQL string.
-func uintSliceToSQL(fps []uint64) string {
+// hexSliceToSQL converts hex-encoded fingerprints to "unhex('aa..'),unhex('bb...')" SQL.
+func hexSliceToSQL(fps []string) string {
 	if len(fps) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.Grow(len(fps) * 20) // uint64 max is 20 digits
+	b.Grow(len(fps) * 40)
 	for i, fp := range fps {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		b.WriteString(strconv.FormatUint(fp, 10))
+		b.WriteString("unhex('")
+		b.WriteString(fp)
+		b.WriteString("')")
 	}
 	return b.String()
 }

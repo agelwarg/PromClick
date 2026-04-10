@@ -43,21 +43,21 @@ func writerDefaults() *WriterConfig {
 		ListenAddr: ":9091",
 		ClickHouse: CHConfig{
 			HTTPAddr: "http://localhost:8123",
-			Database: "metrics",
+			Database: "data__tagset",
 			User:     "default",
 			Password: "",
 		},
 		Schema: SchemaConfig{
-			SamplesTable:    "samples",
-			TimeSeriesTable: "time_series",
+			SamplesTable:    "__ts_samples__float64",
+			TimeSeriesTable: "__ts_by_name",
 			Columns: ColumnConfig{
-				MetricName:  "metric_name",
-				Timestamp:   "unix_milli",
+				MetricName:  "__name__",
+				Timestamp:   "poll_epoch_ns",
 				Value:       "value",
 				Fingerprint: "fingerprint",
-				Labels:      "labels",
+				Labels:      "tag_names",
 			},
-			LabelsType: "json",
+			LabelsType: "arrays",
 		},
 		Write: WriteSettings{
 			BatchSize:     10000,

@@ -7,7 +7,7 @@ func TestCompute_Deterministic(t *testing.T) {
 	a := Compute(labels)
 	b := Compute(labels)
 	if a != b {
-		t.Errorf("non-deterministic: %d != %d", a, b)
+		t.Errorf("non-deterministic: %x != %x", a, b)
 	}
 }
 
@@ -15,7 +15,7 @@ func TestCompute_OrderIndependent(t *testing.T) {
 	a := Compute(map[string]string{"a": "1", "b": "2", "c": "3"})
 	b := Compute(map[string]string{"c": "3", "a": "1", "b": "2"})
 	if a != b {
-		t.Errorf("order-dependent: %d != %d", a, b)
+		t.Errorf("order-dependent: %x != %x", a, b)
 	}
 }
 
@@ -23,14 +23,14 @@ func TestCompute_DifferentLabels_DifferentHash(t *testing.T) {
 	a := Compute(map[string]string{"job": "api"})
 	b := Compute(map[string]string{"job": "web"})
 	if a == b {
-		t.Errorf("collision: both = %d", a)
+		t.Errorf("collision: both = %x", a)
 	}
 }
 
 func TestCompute_EmptyLabels(t *testing.T) {
 	fp := Compute(map[string]string{})
-	if fp == 0 {
-		t.Error("empty labels should produce non-zero fingerprint")
+	if fp == [16]byte{} {
+		t.Error("empty labels should produce non-zero fingerprint (MD5 of empty input is d41d8cd9...)")
 	}
 }
 
@@ -39,6 +39,15 @@ func TestCompute_KeyValueSeparation(t *testing.T) {
 	a := Compute(map[string]string{"a": "bc"})
 	b := Compute(map[string]string{"ab": "c"})
 	if a == b {
-		t.Errorf("key-value boundary collision: both = %d", a)
+		t.Errorf("key-value boundary collision: both = %x", a)
+	}
+}
+
+func TestCompute_IncludesName(t *testing.T) {
+	// __name__ participates in the fingerprint
+	a := Compute(map[string]string{"__name__": "foo", "job": "api"})
+	b := Compute(map[string]string{"__name__": "bar", "job": "api"})
+	if a == b {
+		t.Errorf("__name__ not included in fingerprint: both = %x", a)
 	}
 }

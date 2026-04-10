@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"fmt"
@@ -435,7 +436,7 @@ func (ev *Evaluator) evalInstantSD(
 	}
 	if !hasSortInChain {
 		slices.SortFunc(result, func(a, b types.InstantSample) int {
-			return cmp.Compare(a.Fingerprint, b.Fingerprint)
+			return bytes.Compare(a.Fingerprint[:], b.Fingerprint[:])
 		})
 	}
 	return result
@@ -516,7 +517,7 @@ func (ev *Evaluator) buildMatrixSD(
 	}
 
 	slices.SortFunc(matrix, func(a, b types.Series) int {
-		return cmp.Compare(a.Fingerprint, b.Fingerprint)
+		return bytes.Compare(a.Fingerprint[:], b.Fingerprint[:])
 	})
 	return matrix
 }
@@ -809,10 +810,10 @@ func (ev *Evaluator) aggregateMatrixSlow(matrix types.Matrix, plan *translator.S
 	cursors := make([]int, len(matrix))
 	type seriesAcc struct {
 		labels  map[string]string
-		fp      uint64
+		fp      [16]byte
 		samples []types.Sample
 	}
-	acc := make(map[uint64]*seriesAcc)
+	acc := make(map[[16]byte]*seriesAcc)
 	vec := make(types.Vector, 0, len(matrix))
 
 	for _, ts := range timestamps {
@@ -947,10 +948,10 @@ func (ev *Evaluator) buildMatrixSD_stepFirst(
 ) types.Matrix {
 	type seriesAcc struct {
 		labels  map[string]string
-		fp      uint64
+		fp      [16]byte
 		samples []types.Sample
 	}
-	acc := make(map[uint64]*seriesAcc, len(seriesMap))
+	acc := make(map[[16]byte]*seriesAcc, len(seriesMap))
 	numSteps := len(steps)
 
 	for _, evalTimeMs := range steps {
@@ -970,7 +971,7 @@ func (ev *Evaluator) buildMatrixSD_stepFirst(
 		matrix = append(matrix, types.Series{Labels: a.labels, Fingerprint: a.fp, Samples: a.samples})
 	}
 	slices.SortFunc(matrix, func(a, b types.Series) int {
-		return cmp.Compare(a.Fingerprint, b.Fingerprint)
+		return bytes.Compare(a.Fingerprint[:], b.Fingerprint[:])
 	})
 	return matrix
 }

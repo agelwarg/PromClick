@@ -2,11 +2,13 @@ package clickhouse
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,30 +22,31 @@ import (
 	"github.com/PromClick/PromClick/types"
 )
 
-// SchemaInfo holds schema metadata for the flat schema.
+// SchemaInfo holds schema metadata for the tagset schema.
 type SchemaInfo struct {
 	Database        string
-	SamplesTable    string
-	TimeSeriesTable string
-	FingerprintCol  string
-	TimestampCol    string
-	ValueCol        string
-	MetricNameCol   string
+	SamplesTable    string // e.g. __ts_samples__float64
+	TimeSeriesTable string // e.g. __ts_by_name
+	FingerprintCol  string // fingerprint
+	TimestampCol    string // poll_epoch_ns
+	ValueCol        string // value
+	MetricNameCol   string // __name__
+	// TimestampNanos: true when the timestamp column stores nanoseconds.
+	// FetchSeriesData will convert ms params → ns for queries, and ns results → ms.
+	TimestampNanos bool
 }
 
 // Pool wraps a ch-go connection pool for native TCP queries.
 type Pool struct {
 	pool         *chpool.Pool
-	LabelCache   *LabelCache
 	Schema       SchemaInfo
-	HTTPClient   *http.Client // shared HTTP client with connection limits
-	httpAddr     string       // CH HTTP addr for DDL/INSERT (e.g. "localhost:18123")
+	HTTPClient   *http.Client
+	httpAddr     string
 	httpUser     string
 	httpPassword string
 }
 
 // NewPool creates a native TCP connection pool to ClickHouse.
-// httpAddr is used for DDL/INSERT...SELECT (e.g. "http://localhost:18123").
 func NewPool(addr, database, user, password, httpAddr string, schema SchemaInfo) (*Pool, error) {
 	opts := chpool.Options{
 		ClientOptions: ch.Options{
@@ -80,55 +83,209 @@ func NewPool(addr, database, user, password, httpAddr string, schema SchemaInfo)
 		httpPassword: password,
 	}
 
-	slog.Info("schema detection",
-		"table", schema.SamplesTable,
-	)
-
+	slog.Info("schema detection", "table", schema.SamplesTable)
 	return pool, nil
 }
 
-// FetchSeriesData satisfies eval.DataFetcher.
-// Uses label cache fast-path when available, falls back to JOIN SQL.
-func (p *Pool) FetchSeriesData(ctx context.Context, sql string, params *chclient.QueryParams) (map[string]*chclient.SeriesData, error) {
-	// Try cache fast-path: extract metric name + matchers from params,
-	// query samples-only SQL (no JOIN), labels from cache
-	if p.LabelCache != nil && p.LabelCache.IsLoaded() {
-		metricName := extractParam(params, "metricName")
-		dataStart := extractParam(params, "dataStart")
-		dataEnd := extractParam(params, "dataEnd")
+// LabelMatcher for Go-side label filtering (used after SQL lookup).
+type LabelMatcher struct {
+	Name  string
+	Op    string // "=", "!=", "=~", "!~"
+	Value string
+}
 
-		if metricName != "" && dataStart != "" && dataEnd != "" {
-			matchers := extractMatchers(params)
-			fps, ok := p.LabelCache.GetFingerprints(metricName, matchers)
-			if ok {
-				return p.fetchWithCache(ctx, metricName, dataStart, dataEnd, fps)
+// regexCache avoids recompiling per call.
+var regexCache sync.Map
+
+func cachedRegexp(pattern string) (*regexp.Regexp, error) {
+	if v, ok := regexCache.Load(pattern); ok {
+		return v.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile("^(?:" + pattern + ")$")
+	if err != nil {
+		return nil, err
+	}
+	regexCache.Store(pattern, re)
+	return re, nil
+}
+
+func matchAll(labels map[string]string, matchers []LabelMatcher) bool {
+	if labels == nil {
+		return false
+	}
+	for _, m := range matchers {
+		v := labels[m.Name]
+		switch m.Op {
+		case "=":
+			if v != m.Value {
+				return false
+			}
+		case "!=":
+			if v == m.Value {
+				return false
+			}
+		case "=~":
+			re, err := cachedRegexp(m.Value)
+			if err != nil || !re.MatchString(v) {
+				return false
+			}
+		case "!~":
+			re, err := cachedRegexp(m.Value)
+			if err != nil || re.MatchString(v) {
+				return false
 			}
 		}
 	}
+	return true
+}
 
-	// Fallback: execute original SQL with JOIN
+// FetchSeriesData satisfies eval.DataFetcher.
+// Looks up fingerprints via __ts_by_name, then fetches samples from __ts_samples__float64.
+func (p *Pool) FetchSeriesData(ctx context.Context, sql string, params *chclient.QueryParams) (map[string]*chclient.SeriesData, error) {
+	metricName := extractParam(params, "metricName")
+	dataStart := extractParam(params, "dataStart")
+	dataEnd := extractParam(params, "dataEnd")
+
+	if metricName != "" && dataStart != "" && dataEnd != "" {
+		matchers := extractMatchers(params)
+		fps, labelMap, err := p.lookupFingerprints(ctx, metricName, matchers)
+		if err != nil {
+			slog.Warn("fingerprint lookup failed", "error", err)
+			return make(map[string]*chclient.SeriesData), nil
+		}
+		return p.fetchWithFingerprints(ctx, metricName, dataStart, dataEnd, fps, labelMap)
+	}
+
+	// No params — fall back to raw SQL (JOIN path not adapted for new schema)
 	return p.fetchWithJoin(ctx, sql, params)
 }
 
-// fetchWithCache — fast path: samples-only query + labels from cache.
-// Uses UInt64 fingerprint directly (no toString conversion, no string allocs per row).
-// Parallel fetch: splits fingerprints into chunks for concurrent CH queries.
-func (p *Pool) fetchWithCache(ctx context.Context,
-	metricName, dataStart, dataEnd string, fps []string) (map[string]*chclient.SeriesData, error) {
+// lookupFingerprints finds fingerprints matching metricName and matchers using
+// the two-path strategy from the Ruby reader:
+//
+//   - Name-only (no equality tag matchers): query __ts_by_name FINAL directly.
+//   - Tag-filtered: query __ts_by_tag FINAL grouped by fingerprint with
+//     hasAll(groupUniqArray(concat(tag,'=',value)), [...]) then join __ts_by_name
+//     to fetch full label arrays.
+//
+// Regex (=~, !~) and negative (!=) matchers are always applied in Go after fetching.
+//
+// Returns:
+//   - fps: hex-encoded fingerprints (32 chars each)
+//   - labelMap: hex-fp → map[string]string (all tags including __name__)
+func (p *Pool) lookupFingerprints(ctx context.Context, metricName string, matchers []LabelMatcher) ([]string, map[string]map[string]string, error) {
+	s := p.Schema
+	escapedMetric := strings.ReplaceAll(metricName, "'", "''")
 
+	// Partition matchers: equality tag matchers pushed to SQL, rest applied in Go.
+	var sqlTagPairs []string // "'key=value'" literals for hasAll()
+	var goMatchers []LabelMatcher
+	for _, m := range matchers {
+		if m.Name == "__name__" || m.Name == s.MetricNameCol {
+			continue // already handled by __name__ = 'x' filter
+		}
+		if m.Op == "=" {
+			ek := strings.ReplaceAll(m.Name, "'", "''")
+			ev := strings.ReplaceAll(m.Value, "'", "''")
+			sqlTagPairs = append(sqlTagPairs, fmt.Sprintf("'%s=%s'", ek, ev))
+		} else {
+			goMatchers = append(goMatchers, m)
+		}
+	}
+
+	var q strings.Builder
+	fmt.Fprintf(&q, "SELECT hex(fingerprint) AS fp, tag_names, tag_values\n")
+	fmt.Fprintf(&q, "FROM %s.%s FINAL\n", s.Database, s.TimeSeriesTable)
+
+	if len(sqlTagPairs) > 0 {
+		// Tag-filtered path: subquery __ts_by_tag with hasAll(groupUniqArray(...))
+		fmt.Fprintf(&q, "WHERE fingerprint IN (\n")
+		fmt.Fprintf(&q, "  SELECT fingerprint\n")
+		fmt.Fprintf(&q, "  FROM %s.__ts_by_tag FINAL\n", s.Database)
+		fmt.Fprintf(&q, "  WHERE __name__ = '%s'\n", escapedMetric)
+		fmt.Fprintf(&q, "  GROUP BY fingerprint\n")
+		fmt.Fprintf(&q, "  HAVING hasAll(groupUniqArray(concat(tag, '=', value)), [%s])\n",
+			strings.Join(sqlTagPairs, ", "))
+		fmt.Fprintf(&q, ")\n")
+	} else {
+		// Name-only path: filter directly by __name__ in __ts_by_name
+		fmt.Fprintf(&q, "WHERE %s = '%s'\n", s.MetricNameCol, escapedMetric)
+	}
+
+	// Execute query via HTTP JSONEachRow
+	u := strings.TrimRight(p.httpAddr, "/") + "/?database=" + s.Database + "&default_format=JSONEachRow"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(q.String()))
+	if err != nil {
+		return nil, nil, err
+	}
+	if p.httpUser != "" {
+		req.SetBasicAuth(p.httpUser, p.httpPassword)
+	}
+	resp, err := p.HTTPClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lookupFingerprints HTTP: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, nil, fmt.Errorf("lookupFingerprints HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	type fpRow struct {
+		FP        string   `json:"fp"`
+		TagNames  []string `json:"tag_names"`
+		TagValues []string `json:"tag_values"`
+	}
+
+	var fps []string
+	labelMap := make(map[string]map[string]string)
+
+	dec := json.NewDecoder(resp.Body)
+	for dec.More() {
+		var r fpRow
+		if err := dec.Decode(&r); err != nil {
+			slog.Warn("lookupFingerprints: skip malformed row", "error", err)
+			continue
+		}
+
+		// Build label map from tag arrays
+		lm := make(map[string]string, len(r.TagNames))
+		for i := range r.TagNames {
+			if i < len(r.TagValues) {
+				lm[r.TagNames[i]] = r.TagValues[i]
+			}
+		}
+
+		// Apply Go-side matchers (regex, !=, !~)
+		if len(goMatchers) > 0 && !matchAll(lm, goMatchers) {
+			continue
+		}
+
+		fps = append(fps, r.FP)
+		labelMap[r.FP] = lm
+	}
+
+	return fps, labelMap, nil
+}
+
+// fetchWithFingerprints fetches samples from __ts_samples__float64 for the given
+// fingerprints and attaches labels from labelMap.
+func (p *Pool) fetchWithFingerprints(ctx context.Context,
+	metricName, dataStart, dataEnd string,
+	fps []string,
+	labelMap map[string]map[string]string,
+) (map[string]*chclient.SeriesData, error) {
 	if len(fps) == 0 {
 		return make(map[string]*chclient.SeriesData), nil
 	}
 
-	// For small series counts, single query is faster (no goroutine overhead)
 	const parallelThreshold = 500
 	const numWorkers = 4
 
 	if len(fps) < parallelThreshold {
-		return p.fetchChunk(ctx, metricName, dataStart, dataEnd, fps)
+		return p.fetchChunk(ctx, metricName, dataStart, dataEnd, fps, labelMap)
 	}
 
-	// Split fps into chunks and fetch in parallel
 	chunkSize := (len(fps) + numWorkers - 1) / numWorkers
 	type chunkResult struct {
 		data map[string]*chclient.SeriesData
@@ -149,13 +306,12 @@ func (p *Pool) fetchWithCache(ctx context.Context,
 		wg.Add(1)
 		go func(idx int, chunk []string) {
 			defer wg.Done()
-			data, err := p.fetchChunk(ctx, metricName, dataStart, dataEnd, chunk)
+			data, err := p.fetchChunk(ctx, metricName, dataStart, dataEnd, chunk, labelMap)
 			results[idx] = chunkResult{data: data, err: err}
 		}(w, fps[lo:hi])
 	}
 	wg.Wait()
 
-	// Merge results
 	merged := make(map[string]*chclient.SeriesData, len(fps))
 	for _, r := range results {
 		if r.err != nil {
@@ -165,53 +321,49 @@ func (p *Pool) fetchWithCache(ctx context.Context,
 			merged[k] = v
 		}
 	}
-
-	t0 := time.Now()
-	_ = t0
-	slog.Debug("ch_fetch",
-		"path", "cached+parallel",
-		"metric", metricName,
-		"fps", len(fps),
-		"series", len(merged),
-	)
 	return merged, nil
 }
 
-// fetchChunk fetches samples for a subset of fingerprints.
+// fetchChunk fetches samples for a subset of fingerprints from __ts_samples__float64.
+// Timestamps in the table are nanoseconds; results are converted to milliseconds.
 func (p *Pool) fetchChunk(ctx context.Context,
-	metricName, dataStart, dataEnd string, fps []string) (map[string]*chclient.SeriesData, error) {
-
+	metricName, dataStart, dataEnd string,
+	fps []string,
+	labelMap map[string]map[string]string,
+) (map[string]*chclient.SeriesData, error) {
 	if len(fps) == 0 {
 		return make(map[string]*chclient.SeriesData), nil
 	}
 
 	s := p.Schema
 	escapedMetric := strings.ReplaceAll(metricName, "'", "''")
-	fpCol := s.FingerprintCol
-	tsCol := s.TimestampCol
-	valCol := s.ValueCol
+
+	// dataStart / dataEnd are milliseconds from the query params.
+	// The samples table stores nanoseconds, so multiply by 1,000,000.
+	tsStart := dataStart + " * 1000000"
+	tsEnd := dataEnd + " * 1000000"
+	if !s.TimestampNanos {
+		tsStart = dataStart
+		tsEnd = dataEnd
+	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "SELECT s.%s AS fingerprint, s.%s AS ts, s.%s AS value\n", fpCol, tsCol, valCol)
-	fmt.Fprintf(&b, "FROM %s AS s\n", s.SamplesTable)
+	fmt.Fprintf(&b, "SELECT hex(s.%s) AS fingerprint, s.%s AS ts, s.%s AS value\n",
+		s.FingerprintCol, s.TimestampCol, s.ValueCol)
+	fmt.Fprintf(&b, "FROM %s.%s AS s\n", s.Database, s.SamplesTable)
 	fmt.Fprintf(&b, "PREWHERE s.%s = '%s'\n", s.MetricNameCol, escapedMetric)
-	fmt.Fprintf(&b, "WHERE s.%s > %s\n", tsCol, dataStart)
-	fmt.Fprintf(&b, "  AND s.%s <= %s\n", tsCol, dataEnd)
+	fmt.Fprintf(&b, "WHERE s.%s > %s\n", s.TimestampCol, tsStart)
+	fmt.Fprintf(&b, "  AND s.%s <= %s\n", s.TimestampCol, tsEnd)
 
-	if inClause := buildFingerprintIN(fps, fmt.Sprintf("s.%s", fpCol)); inClause != "" {
+	if inClause := buildFingerprintIN(fps, fmt.Sprintf("s.%s", s.FingerprintCol)); inClause != "" {
 		fmt.Fprintf(&b, "  %s\n", inClause)
 	}
+	fmt.Fprintf(&b, "ORDER BY s.%s ASC, s.%s ASC", s.FingerprintCol, s.TimestampCol)
 
-	fmt.Fprintf(&b, "ORDER BY s.%s ASC, s.%s ASC", fpCol, tsCol)
-
-	type seriesData struct {
-		labels  map[string]string
-		samples []types.Sample
-	}
-	intResult := make(map[uint64]*seriesData, len(fps))
+	result := make(map[string]*chclient.SeriesData, len(fps))
 
 	var (
-		colFP  proto.ColUInt64
+		colFP  proto.ColStr
 		colTS  proto.ColInt64
 		colVal proto.ColFloat64
 	)
@@ -225,34 +377,33 @@ func (p *Pool) fetchChunk(ctx context.Context,
 		},
 		OnResult: func(_ context.Context, block proto.Block) error {
 			for i := 0; i < block.Rows; i++ {
-				fp := colFP.Row(i)
+				fpStr := colFP.Row(i)
+				tsVal := colTS.Row(i)
 
-				sd, ok := intResult[fp]
+				// Convert nanoseconds → milliseconds for the Series timestamp
+				if s.TimestampNanos {
+					tsVal /= 1_000_000
+				}
+
+				sd, ok := result[fpStr]
 				if !ok {
-					fpStr := strconv.FormatUint(fp, 10)
-					labels, hit := p.LabelCache.GetLabels(fpStr)
-					if !hit {
+					labels := labelMap[fpStr]
+					if labels == nil {
 						labels = map[string]string{}
 					}
-					sd = &seriesData{labels: labels}
-					intResult[fp] = sd
+					sd = &chclient.SeriesData{Labels: labels}
+					result[fpStr] = sd
 				}
-				sd.samples = append(sd.samples, types.Sample{Timestamp: colTS.Row(i), Value: colVal.Row(i)})
+				sd.Samples = append(sd.Samples, types.Sample{Timestamp: tsVal, Value: colVal.Row(i)})
 			}
 			return nil
 		},
 	})
-
-	// Convert uint64 map → string map (required by DataFetcher interface)
-	result := make(map[string]*chclient.SeriesData, len(intResult))
-	for fp, sd := range intResult {
-		result[strconv.FormatUint(fp, 10)] = &chclient.SeriesData{Labels: sd.labels, Samples: sd.samples}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("native (cached): %w", err)
 	}
 	slog.Debug("ch_fetch",
-		"path", "cached+prewhere",
+		"path", "lookup+prewhere",
 		"metric", metricName,
 		"fps", len(fps),
 		"series", len(result),
@@ -260,7 +411,9 @@ func (p *Pool) fetchChunk(ctx context.Context,
 	return result, nil
 }
 
-// fetchWithJoin — fallback: original SQL with JOIN + labels from response.
+// fetchWithJoin — fallback path using translator-generated SQL.
+// NOTE: This path is not adapted for the tagset schema and is retained only
+// as a fallback for queries that arrive without full params.
 func (p *Pool) fetchWithJoin(ctx context.Context, sql string, params *chclient.QueryParams) (map[string]*chclient.SeriesData, error) {
 	t0 := time.Now()
 	totalRows := 0
@@ -316,16 +469,13 @@ func (p *Pool) fetchWithJoin(ctx context.Context, sql string, params *chclient.Q
 }
 
 // ExecTierQuery executes a downsampled query and returns Matrix result.
-// The query returns (fingerprint, step_ts, value) rows.
 func (p *Pool) ExecTierQuery(ctx context.Context, sql string, fps []string) (types.Matrix, error) {
 	t0 := time.Now()
 	totalRows := 0
-
-	// Map fingerprint string → series data
 	seriesMap := make(map[string]*types.Series)
 
 	var (
-		colFP  proto.ColUInt64
+		colFP  proto.ColStr
 		colTS  proto.ColDateTime
 		colVal proto.ColFloat64
 	)
@@ -340,22 +490,18 @@ func (p *Pool) ExecTierQuery(ctx context.Context, sql string, fps []string) (typ
 		OnResult: func(_ context.Context, block proto.Block) error {
 			totalRows += block.Rows
 			for i := 0; i < block.Rows; i++ {
-				fp := fmt.Sprintf("%d", colFP.Row(i))
+				fp := colFP.Row(i)
 				ts := colTS.Row(i).UnixMilli()
-				val := colVal.Row(i)
 
 				s, ok := seriesMap[fp]
 				if !ok {
-					labels := map[string]string{}
-					if p.LabelCache != nil {
-						if cached, hit := p.LabelCache.GetLabels(fp); hit {
-							labels = cached
-						}
-					}
-					s = &types.Series{Labels: labels}
+					fpBytes, _ := hex.DecodeString(fp)
+					var fp16 [16]byte
+					copy(fp16[:], fpBytes)
+					s = &types.Series{Fingerprint: fp16, Labels: map[string]string{}}
 					seriesMap[fp] = s
 				}
-				s.Samples = append(s.Samples, types.Sample{Timestamp: ts, Value: val})
+				s.Samples = append(s.Samples, types.Sample{Timestamp: ts, Value: colVal.Row(i)})
 			}
 			return nil
 		},
@@ -364,7 +510,6 @@ func (p *Pool) ExecTierQuery(ctx context.Context, sql string, fps []string) (typ
 		return nil, fmt.Errorf("tier query: %w", err)
 	}
 
-	// Build matrix from map
 	matrix := make(types.Matrix, 0, len(seriesMap))
 	for _, s := range seriesMap {
 		matrix = append(matrix, *s)
@@ -378,12 +523,12 @@ func (p *Pool) ExecTierQuery(ctx context.Context, sql string, fps []string) (typ
 	return matrix, nil
 }
 
-// CounterBucket holds per-bucket counter data with timing info for extrapolation.
+// CounterBucket holds per-bucket counter data.
 type CounterBucket struct {
-	Timestamp    int64   // bucket ts in ms
-	CounterTotal float64 // delta per bucket
-	FirstTime    int64   // ms — first sample timestamp in bucket
-	LastTime     int64   // ms — last sample timestamp in bucket
+	Timestamp    int64
+	CounterTotal float64
+	FirstTime    int64
+	LastTime     int64
 }
 
 // CounterSeries holds per-bucket counter data for one fingerprint.
@@ -392,15 +537,14 @@ type CounterSeries struct {
 	Buckets []CounterBucket
 }
 
-// ExecTierQueryRaw executes a counter tier query returning per-bucket data
-// with first_time/last_time for Prometheus-compatible extrapolation.
+// ExecTierQueryRaw executes a counter tier query.
 func (p *Pool) ExecTierQueryRaw(ctx context.Context, sql string, fps []string) (map[string]*CounterSeries, error) {
 	t0 := time.Now()
 	totalRows := 0
 	seriesMap := make(map[string]*CounterSeries)
 
 	var (
-		colFP  proto.ColUInt64
+		colFP  proto.ColStr
 		colTS  proto.ColInt64
 		colVal proto.ColFloat64
 		colFT  proto.ColInt64
@@ -419,16 +563,10 @@ func (p *Pool) ExecTierQueryRaw(ctx context.Context, sql string, fps []string) (
 		OnResult: func(_ context.Context, block proto.Block) error {
 			totalRows += block.Rows
 			for i := 0; i < block.Rows; i++ {
-				fp := fmt.Sprintf("%d", colFP.Row(i))
+				fp := colFP.Row(i)
 				s, ok := seriesMap[fp]
 				if !ok {
-					labels := map[string]string{}
-					if p.LabelCache != nil {
-						if cached, hit := p.LabelCache.GetLabels(fp); hit {
-							labels = cached
-						}
-					}
-					s = &CounterSeries{Labels: labels}
+					s = &CounterSeries{Labels: map[string]string{}}
 					seriesMap[fp] = s
 				}
 				s.Buckets = append(s.Buckets, CounterBucket{
@@ -444,7 +582,6 @@ func (p *Pool) ExecTierQueryRaw(ctx context.Context, sql string, fps []string) (
 	if err != nil {
 		return nil, fmt.Errorf("tier query raw: %w", err)
 	}
-
 	slog.Debug("tier_query_raw", "rows", totalRows, "series", len(seriesMap), "duration", time.Since(t0))
 	return seriesMap, nil
 }
@@ -458,14 +595,20 @@ type GaugeBucket struct {
 	ValMax    float64
 }
 
-// ExecGaugeQuery executes a gauge tier query returning per-bucket data with 4 value columns.
+// GaugeSeries holds per-bucket gauge data for one fingerprint.
+type GaugeSeries struct {
+	Labels  map[string]string
+	Buckets []GaugeBucket
+}
+
+// ExecGaugeQuery executes a gauge tier query.
 func (p *Pool) ExecGaugeQuery(ctx context.Context, sql string, fps []string) (map[string]*GaugeSeries, error) {
 	t0 := time.Now()
 	totalRows := 0
 	seriesMap := make(map[string]*GaugeSeries)
 
 	var (
-		colFP       proto.ColUInt64
+		colFP       proto.ColStr
 		colTS       proto.ColInt64
 		colValSum   proto.ColFloat64
 		colValCount proto.ColUInt64
@@ -486,16 +629,10 @@ func (p *Pool) ExecGaugeQuery(ctx context.Context, sql string, fps []string) (ma
 		OnResult: func(_ context.Context, block proto.Block) error {
 			totalRows += block.Rows
 			for i := 0; i < block.Rows; i++ {
-				fp := fmt.Sprintf("%d", colFP.Row(i))
+				fp := colFP.Row(i)
 				s, ok := seriesMap[fp]
 				if !ok {
-					labels := map[string]string{}
-					if p.LabelCache != nil {
-						if cached, hit := p.LabelCache.GetLabels(fp); hit {
-							labels = cached
-						}
-					}
-					s = &GaugeSeries{Labels: labels}
+					s = &GaugeSeries{Labels: map[string]string{}}
 					seriesMap[fp] = s
 				}
 				s.Buckets = append(s.Buckets, GaugeBucket{
@@ -512,19 +649,11 @@ func (p *Pool) ExecGaugeQuery(ctx context.Context, sql string, fps []string) (ma
 	if err != nil {
 		return nil, fmt.Errorf("gauge tier query: %w", err)
 	}
-
 	slog.Debug("gauge_tier_query", "rows", totalRows, "series", len(seriesMap), "duration", time.Since(t0))
 	return seriesMap, nil
 }
 
-// GaugeSeries holds per-bucket gauge data for one fingerprint.
-type GaugeSeries struct {
-	Labels  map[string]string
-	Buckets []GaugeBucket
-}
-
-// Exec executes a raw SQL statement via HTTP (for DDL, INSERT...SELECT, ALTER etc.)
-// ch-go native TCP doesn't reliably handle INSERT...SELECT, so we use HTTP.
+// Exec executes a raw SQL statement via HTTP (DDL, ALTER, etc.)
 func (p *Pool) Exec(ctx context.Context, sql string) error {
 	u := strings.TrimRight(p.httpAddr, "/") + "/?database=" + p.Schema.Database
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(sql))
@@ -548,7 +677,6 @@ func (p *Pool) Exec(ctx context.Context, sql string) error {
 
 // QueryRow executes a query and scans the first row into dest.
 func (p *Pool) QueryRow(ctx context.Context, sql string, dest ...interface{}) error {
-	// Simple single-value scan for uint64
 	if len(dest) == 1 {
 		if ptr, ok := dest[0].(*uint64); ok {
 			var col proto.ColUInt64
@@ -582,39 +710,12 @@ func (p *Pool) QueryRow(ctx context.Context, sql string, dest ...interface{}) er
 	return fmt.Errorf("QueryRow: unsupported dest type")
 }
 
-// queryJSON executes a SQL query via HTTP and unmarshals the first JSONEachRow result.
-func (p *Pool) queryJSON(ctx context.Context, sql string, dest interface{}) error {
-	u := strings.TrimRight(p.httpAddr, "/") + "/?database=" + p.Schema.Database + "&default_format=JSONEachRow"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(sql))
-	if err != nil {
-		return err
-	}
-	if p.httpUser != "" {
-		req.SetBasicAuth(p.httpUser, p.httpPassword)
-	}
-	resp, err := p.HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	dec := json.NewDecoder(resp.Body)
-	if dec.More() {
-		return dec.Decode(dest)
-	}
-	return fmt.Errorf("no rows returned")
-}
-
 // extractParam gets a param value from QueryParams by name (without param_ prefix).
 func extractParam(params *chclient.QueryParams, name string) string {
 	if params == nil {
 		return ""
 	}
-	v := params.URLValues().Get("param_" + name)
-	return v
+	return params.URLValues().Get("param_" + name)
 }
 
 // extractMatchers extracts label matchers (lk0/lv0/lo0, lk1/lv1/lo1...) from params.
@@ -633,7 +734,7 @@ func extractMatchers(params *chclient.QueryParams) []LabelMatcher {
 			break
 		}
 		if lo == "" {
-			lo = "=" // fallback
+			lo = "="
 		}
 		matchers = append(matchers, LabelMatcher{Name: lk, Op: lo, Value: lv})
 	}
@@ -667,6 +768,45 @@ func inlineParams(sql string, params *chclient.QueryParams) string {
 	return result
 }
 
+// buildFingerprintIN builds "AND fingerprint IN (unhex('aa...'), unhex('bb...'))"
+// for FixedString(16) hex-encoded fingerprints.
+func buildFingerprintIN(fps []string, fpColumn string) string {
+	if len(fps) == 0 {
+		return ""
+	}
+	wrapped := make([]string, len(fps))
+	for i, fp := range fps {
+		wrapped[i] = "unhex('" + fp + "')"
+	}
+	return "AND " + fpColumn + " IN (" + strings.Join(wrapped, ",") + ")"
+}
+
+// queryJSON executes a SQL query via HTTP JSONEachRow and decodes the first row into dest.
+func (p *Pool) queryJSON(ctx context.Context, sql string, dest interface{}) error {
+	u := strings.TrimRight(p.httpAddr, "/") + "/?database=" + p.Schema.Database + "&default_format=JSONEachRow"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(sql))
+	if err != nil {
+		return err
+	}
+	if p.httpUser != "" {
+		req.SetBasicAuth(p.httpUser, p.httpPassword)
+	}
+	resp, err := p.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("queryJSON: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("queryJSON HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	dec := json.NewDecoder(resp.Body)
+	if dec.More() {
+		return dec.Decode(dest)
+	}
+	return nil
+}
+
 // Ping establishes a connection and warms up the pool.
 func (p *Pool) Ping(ctx context.Context) error {
 	var col proto.ColUInt8
@@ -675,14 +815,6 @@ func (p *Pool) Ping(ctx context.Context) error {
 		Result: proto.Results{{Name: "1", Data: &col}},
 		OnResult: func(_ context.Context, _ proto.Block) error { return nil },
 	})
-}
-
-// buildFingerprintIN builds an AND ... IN (...) clause for UInt64 fingerprints.
-func buildFingerprintIN(fps []string, fpColumn string) string {
-	if len(fps) == 0 {
-		return ""
-	}
-	return "AND " + fpColumn + " IN (" + strings.Join(fps, ",") + ")"
 }
 
 // Close closes the pool.

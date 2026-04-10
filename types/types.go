@@ -10,15 +10,15 @@ type Sample struct {
 // Series is a full series with labels and samples.
 type Series struct {
 	Labels      map[string]string
-	Fingerprint uint64
+	Fingerprint [16]byte
 	Samples     []Sample // sorted by Timestamp ASC
 }
 
 // InstantSample is the result of an instant query for a single series.
 type InstantSample struct {
 	Labels      map[string]string
-	Fingerprint uint64
-	T           int64   // eval_time w ms
+	Fingerprint [16]byte
+	T           int64   // eval_time in ms
 	F           float64 // value
 }
 

@@ -110,17 +110,17 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	cfg := &Config{}
 	cfg.ClickHouse.Addr = "http://localhost:8123"
-	cfg.ClickHouse.Database = "default"
+	cfg.ClickHouse.Database = "data__tagset"
 	cfg.ClickHouse.QueryTimeout = 30 * time.Second
 	cfg.ClickHouse.MaxOpenConns = 10
-	cfg.Schema.SamplesTable = "samples"
-	cfg.Schema.TimeSeriesTable = "time_series"
-	cfg.Schema.Columns.MetricName = "metric_name"
-	cfg.Schema.Columns.Timestamp = "unix_milli"
+	cfg.Schema.SamplesTable = "__ts_samples__float64"
+	cfg.Schema.TimeSeriesTable = "__ts_by_name"
+	cfg.Schema.Columns.MetricName = "__name__"
+	cfg.Schema.Columns.Timestamp = "poll_epoch_ns"
 	cfg.Schema.Columns.Value = "value"
 	cfg.Schema.Columns.Fingerprint = "fingerprint"
-	cfg.Schema.Columns.Labels = "labels"
-	cfg.Schema.LabelsType = "json"
+	cfg.Schema.Columns.Labels = "tag_names"
+	cfg.Schema.LabelsType = "arrays"
 	cfg.Schema.JSONExtractFunc = "JSONExtractString"
 	cfg.Prometheus.StalenessSeconds = 300
 	cfg.Prometheus.MaxSamples = 50_000_000
