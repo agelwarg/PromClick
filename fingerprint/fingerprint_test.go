@@ -30,7 +30,7 @@ func TestCompute_DifferentLabels_DifferentHash(t *testing.T) {
 func TestCompute_EmptyLabels(t *testing.T) {
 	fp := Compute(map[string]string{})
 	if fp == [16]byte{} {
-		t.Error("empty labels should produce non-zero fingerprint (MD5 of empty input is d41d8cd9...)")
+		t.Error("empty labels should produce non-zero fingerprint (xxh3 of empty input is non-zero)")
 	}
 }
 
